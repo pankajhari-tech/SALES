@@ -1,14 +1,15 @@
-# Netlify Configuration for Vite React SPA
+# Netlify Configuration for Vite React Application
 [build]
   command = "npm run build"
   publish = "dist"
 
 [build.environment]
   NODE_VERSION = "20"
-  NPM_FLAGS = "--legacy-peer-deps"
+  NPM_FLAGS = "--legacy-peer-deps --include=dev"
+  CI = "false"
 
-# Single Page App (SPA) redirect rule
-# Ensures all URLs are served by index.html so client-side routing works
+# Single Page Application (SPA) Routing Rule
+# Resolves all routes back to index.html with a 200 OK status
 [[redirects]]
   from = "/*"
   to = "/index.html"
@@ -19,7 +20,6 @@
   for = "/*"
   [headers.values]
     X-Frame-Options = "SAMEORIGIN"
-    X-XSS-Protection = "1; mode=block"
     X-Content-Type-Options = "nosniff"
     Referrer-Policy = "strict-origin-when-cross-origin"
 
