@@ -1,0 +1,6 @@
+{
+  "name": "SalesTracker Pro",
+  "description": "Professional sales tracking and management system with live Google Sheets sync, customer ledgers, and financial analytics in NPR.",
+  "requestFramePermissions": [],
+  "majorCapabilities": ["MAJOR_CAPABILITY_SERVER_SIDE_GEMINI_API"]
+}
