@@ -9,9 +9,16 @@ import {
 } from 'firebase/auth';
 import firebaseConfig from '../../firebase-applet-config.json';
 
-// Initialize Firebase App instance safely (singleton)
-const app = getApps().length > 0 ? getApp() : initializeApp(firebaseConfig);
-const auth = getAuth(app);
+// Initialize Firebase App instance safely (singleton with fallback protection)
+let app: any = null;
+let auth: any = null;
+
+try {
+  app = getApps().length > 0 ? getApp() : initializeApp(firebaseConfig);
+  auth = getAuth(app);
+} catch (err) {
+  console.warn('Firebase initialization deferred or unavailable:', err);
+}
 
 // Configure Google Auth Provider with Google Sheets & Drive scopes
 const provider = new GoogleAuthProvider();
@@ -35,6 +42,11 @@ export const initAuth = (
   onAuthSuccess?: (user: User, token: string) => void,
   onAuthFailure?: () => void
 ) => {
+  if (!auth) {
+    if (onAuthFailure) onAuthFailure();
+    return () => {};
+  }
+
   return onAuthStateChanged(auth, async (user: User | null) => {
     if (user) {
       if (cachedAccessToken) {
@@ -55,6 +67,10 @@ export const initAuth = (
  * Trigger Google Sign-In popup with required Google Sheets scopes
  */
 export const googleSignIn = async (): Promise<{ user: User; accessToken: string } | null> => {
+  if (!auth) {
+    throw new Error('Google authentication service is not initialized. Ensure your deployment domain is authorized in Firebase Console or use Local/Excel mode.');
+  }
+
   try {
     isSigningIn = true;
     const result = await signInWithPopup(auth, provider);
@@ -92,7 +108,9 @@ export const setCachedAccessToken = (token: string | null) => {
  */
 export const logout = async () => {
   try {
-    await signOut(auth);
+    if (auth) {
+      await signOut(auth);
+    }
   } finally {
     cachedAccessToken = null;
   }
