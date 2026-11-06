@@ -17,29 +17,34 @@ try {
   app = getApps().length > 0 ? getApp() : initializeApp(firebaseConfig);
   auth = getAuth(app);
 } catch (err) {
-  console.warn('Firebase initialization deferred or unavailable:', err);
+  console.warn('Firebase initialization note:', err);
 }
 
-// Configure Google Auth Provider with Google Sheets & Drive scopes
+// Scopes required for Google Sheets & Google Drive File creation
+export const GOOGLE_WORKSPACE_SCOPES = [
+  'https://www.googleapis.com/auth/spreadsheets',
+  'https://www.googleapis.com/auth/drive.file',
+];
+
+// Configure Google Auth Provider
 const provider = new GoogleAuthProvider();
-provider.addScope('https://www.googleapis.com/auth/spreadsheets');
-provider.addScope('https://www.googleapis.com/auth/drive.file');
-// Prompt user to select an account if needed
+GOOGLE_WORKSPACE_SCOPES.forEach((scope) => provider.addScope(scope));
 provider.setCustomParameters({
   prompt: 'select_account',
 });
 
-// Flag indicating if a sign-in popup flow is in progress
+// Flag indicating if a sign-in flow is currently active
 let isSigningIn = false;
 
 // In-memory cache for the access token (per security requirements)
 let cachedAccessToken: string | null = null;
+let cachedUserInfo: { uid: string; displayName: string | null; email: string | null; photoURL: string | null } | null = null;
 
 /**
  * Initialize auth listener on application load
  */
 export const initAuth = (
-  onAuthSuccess?: (user: User, token: string) => void,
+  onAuthSuccess?: (user: any, token: string) => void,
   onAuthFailure?: () => void
 ) => {
   if (!auth) {
@@ -52,10 +57,12 @@ export const initAuth = (
       if (cachedAccessToken) {
         if (onAuthSuccess) onAuthSuccess(user, cachedAccessToken);
       } else if (!isSigningIn) {
-        // Token has expired or was cleared on refresh; needs sign-in to obtain fresh OAuth access token
         cachedAccessToken = null;
         if (onAuthFailure) onAuthFailure();
       }
+    } else if (cachedUserInfo && cachedAccessToken) {
+      // Kept in memory via Google Identity Services
+      if (onAuthSuccess) onAuthSuccess(cachedUserInfo, cachedAccessToken);
     } else {
       cachedAccessToken = null;
       if (onAuthFailure) onAuthFailure();
@@ -64,23 +71,132 @@ export const initAuth = (
 };
 
 /**
- * Trigger Google Sign-In popup with required Google Sheets scopes
+ * Fallback: Authenticate using Google Identity Services (GIS) Token Client
+ * Useful when Firebase Auth encounters domain authorization or popup restrictions
  */
-export const googleSignIn = async (): Promise<{ user: User; accessToken: string } | null> => {
-  if (!auth) {
-    throw new Error('Google authentication service is not initialized. Ensure your deployment domain is authorized in Firebase Console or use Local/Excel mode.');
-  }
-
-  try {
-    isSigningIn = true;
-    const result = await signInWithPopup(auth, provider);
-    const credential = GoogleAuthProvider.credentialFromResult(result);
-    if (!credential?.accessToken) {
-      throw new Error('Failed to obtain Google OAuth access token from authentication.');
+async function signInWithGoogleIdentityServices(): Promise<{ user: any; accessToken: string }> {
+  return new Promise((resolve, reject) => {
+    const clientId = firebaseConfig.oAuthClientId;
+    if (!clientId) {
+      return reject(new Error('Google OAuth Client ID is not configured in firebase-applet-config.json.'));
     }
 
-    cachedAccessToken = credential.accessToken;
-    return { user: result.user, accessToken: cachedAccessToken };
+    const checkGsiReady = () => {
+      return typeof (window as any).google !== 'undefined' && (window as any).google.accounts?.oauth2;
+    };
+
+    const proceedWithClient = () => {
+      try {
+        const tokenClient = (window as any).google.accounts.oauth2.initTokenClient({
+          client_id: clientId,
+          scope: GOOGLE_WORKSPACE_SCOPES.join(' '),
+          callback: async (tokenResponse: any) => {
+            if (tokenResponse.error) {
+              return reject(new Error(tokenResponse.error_description || tokenResponse.error || 'Google authorization failed.'));
+            }
+
+            const token = tokenResponse.access_token;
+            if (!token) {
+              return reject(new Error('No access token received from Google Identity Services.'));
+            }
+
+            cachedAccessToken = token;
+
+            // Fetch user profile from Google UserInfo endpoint
+            let userInfo = {
+              uid: `gsi-${Date.now()}`,
+              displayName: 'Google Account User',
+              email: null as string | null,
+              photoURL: null as string | null,
+            };
+
+            try {
+              const profileRes = await fetch('https://www.googleapis.com/oauth2/v3/userinfo', {
+                headers: { Authorization: `Bearer ${token}` },
+              });
+              if (profileRes.ok) {
+                const profile = await profileRes.json();
+                userInfo = {
+                  uid: profile.sub || userInfo.uid,
+                  displayName: profile.name || profile.given_name || 'Google User',
+                  email: profile.email || null,
+                  photoURL: profile.picture || null,
+                };
+              }
+            } catch (pErr) {
+              console.warn('Profile fetch notice:', pErr);
+            }
+
+            cachedUserInfo = userInfo;
+            resolve({ user: userInfo, accessToken: token });
+          },
+        });
+
+        tokenClient.requestAccessToken({ prompt: 'consent' });
+      } catch (err) {
+        reject(err);
+      }
+    };
+
+    if (checkGsiReady()) {
+      proceedWithClient();
+    } else {
+      // Wait up to 3 seconds for GIS script to load
+      let attempts = 0;
+      const interval = setInterval(() => {
+        attempts++;
+        if (checkGsiReady()) {
+          clearInterval(interval);
+          proceedWithClient();
+        } else if (attempts > 30) {
+          clearInterval(interval);
+          reject(new Error('Google Identity Services client library did not load. Please check your internet connection and retry.'));
+        }
+      }, 100);
+    }
+  });
+}
+
+/**
+ * Trigger Google Sign-In with full Google Sheets & Drive scopes
+ * Uses Firebase Auth with automatic fallback to Google Identity Services
+ */
+export const googleSignIn = async (): Promise<{ user: any; accessToken: string } | null> => {
+  try {
+    isSigningIn = true;
+
+    // Strategy 1: Attempt Firebase Auth popup if auth is initialized
+    if (auth) {
+      try {
+        const result = await signInWithPopup(auth, provider);
+        const credential = GoogleAuthProvider.credentialFromResult(result);
+        const token =
+          credential?.accessToken ||
+          (result as any)._tokenResponse?.oauthAccessToken ||
+          (result as any).user?.accessToken;
+
+        if (token) {
+          cachedAccessToken = token;
+          cachedUserInfo = {
+            uid: result.user.uid,
+            displayName: result.user.displayName,
+            email: result.user.email,
+            photoURL: result.user.photoURL,
+          };
+          return { user: result.user, accessToken: token };
+        }
+      } catch (fbErr: any) {
+        console.warn('Firebase Popup attempt notice, switching to Google Identity Services:', fbErr);
+        // If popup was explicitly closed by the user, don't trigger secondary popup
+        if (fbErr.code === 'auth/popup-closed-by-user') {
+          throw new Error('Sign-in cancelled. Please select your Google account in the popup.');
+        }
+      }
+    }
+
+    // Strategy 2: Google Identity Services (GIS) Token Client
+    const gisResult = await signInWithGoogleIdentityServices();
+    return gisResult;
   } catch (error: any) {
     console.error('Google Sign-In Error:', error);
     throw error;
@@ -97,7 +213,7 @@ export const getAccessToken = async (): Promise<string | null> => {
 };
 
 /**
- * Set an access token manually (if retrieved during explicit sign in)
+ * Set an access token manually
  */
 export const setCachedAccessToken = (token: string | null) => {
   cachedAccessToken = token;
@@ -111,8 +227,11 @@ export const logout = async () => {
     if (auth) {
       await signOut(auth);
     }
+  } catch (e) {
+    console.warn('Sign-out warning:', e);
   } finally {
     cachedAccessToken = null;
+    cachedUserInfo = null;
   }
 };
 

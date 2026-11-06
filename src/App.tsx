@@ -187,12 +187,36 @@ export default function App() {
   };
 
   // Create Dedicated Spreadsheet
-  const handleCreateNewSheet = async () => {
-    const token = authState.accessToken || (await getAccessToken());
-    if (!token) {
-      await handleSignIn();
-      return;
+  // Helper to ensure valid Google OAuth token before any Google API action
+  const ensureGoogleToken = async (): Promise<string | null> => {
+    let token = authState.accessToken || (await getAccessToken());
+    if (token) return token;
+
+    try {
+      const res = await googleSignIn();
+      if (res?.accessToken) {
+        setAuthState({
+          isSignedIn: true,
+          user: {
+            uid: res.user.uid,
+            displayName: res.user.displayName,
+            email: res.user.email,
+            photoURL: res.user.photoURL,
+          },
+          accessToken: res.accessToken,
+        });
+        return res.accessToken;
+      }
+    } catch (err: any) {
+      showToast(err.message || 'Failed to authorize with Google.', 'error');
     }
+    return null;
+  };
+
+  // Create Dedicated Spreadsheet
+  const handleCreateNewSheet = async () => {
+    const token = await ensureGoogleToken();
+    if (!token) return;
 
     try {
       setSheetConfig((prev) => ({ ...prev, isSyncing: true, syncError: null }));
@@ -229,11 +253,8 @@ export default function App() {
       cleanId = urlMatch[1];
     }
 
-    const token = authState.accessToken || (await getAccessToken());
-    if (!token) {
-      await handleSignIn();
-      return;
-    }
+    const token = await ensureGoogleToken();
+    if (!token) return;
 
     try {
       setSheetConfig((prev) => ({ ...prev, isSyncing: true, syncError: null }));
@@ -269,11 +290,8 @@ export default function App() {
   // Sync from Sheet (pull latest from Google Sheets)
   const handleSyncFromSheet = async () => {
     if (!sheetConfig.spreadsheetId) return;
-    const token = authState.accessToken || (await getAccessToken());
-    if (!token) {
-      await handleSignIn();
-      return;
-    }
+    const token = await ensureGoogleToken();
+    if (!token) return;
 
     try {
       setSheetConfig((prev) => ({ ...prev, isSyncing: true }));
@@ -296,11 +314,8 @@ export default function App() {
   // Push all to Sheet (overwrite batch sync)
   const handlePushToSheet = async () => {
     if (!sheetConfig.spreadsheetId) return;
-    const token = authState.accessToken || (await getAccessToken());
-    if (!token) {
-      await handleSignIn();
-      return;
-    }
+    const token = await ensureGoogleToken();
+    if (!token) return;
 
     try {
       setSheetConfig((prev) => ({ ...prev, isSyncing: true }));
