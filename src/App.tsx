@@ -460,10 +460,18 @@ export default function App() {
   // Lock Application
   const handleLockSystem = () => {
     localStorage.removeItem('salestracker_auth_session');
+    localStorage.removeItem('salestracker_auth_token');
+    localStorage.removeItem('salestracker_auth_email');
     sessionStorage.removeItem('salestracker_auth_session');
+    sessionStorage.removeItem('salestracker_auth_token');
     setIsUnlocked(false);
     showToast('Application locked. Master credentials required.', 'info');
   };
+
+  // Clean up any historical plaintext email storage on startup
+  useEffect(() => {
+    localStorage.removeItem('salestracker_auth_email');
+  }, []);
 
   // MASTER SECURITY BARRIER: If not unlocked, render lock screen exclusively
   if (!isUnlocked) {
@@ -471,7 +479,7 @@ export default function App() {
       <SecurityLockScreen
         onUnlock={() => {
           setIsUnlocked(true);
-          showToast('Welcome back, Pankaj Yadav! System unlocked.');
+          showToast('Access Authorized. Master session active.');
         }}
         isDarkMode={isDarkMode}
         onToggleDarkMode={() => setIsDarkMode((prev) => !prev)}

@@ -1,4 +1,4 @@
-import React, { useState } from 'react';
+import React, { useState, useEffect, useRef } from 'react';
 import {
   ShieldCheck,
   Lock,
@@ -6,10 +6,10 @@ import {
   KeyRound,
   Eye,
   EyeOff,
-  AlertTriangle,
-  Sparkles,
   ArrowRight,
   ShieldAlert,
+  Clock,
+  CheckCircle2,
 } from 'lucide-react';
 
 interface SecurityLockScreenProps {
@@ -18,8 +18,42 @@ interface SecurityLockScreenProps {
   onToggleDarkMode: () => void;
 }
 
-export const AUTHORIZED_EMAIL = 'pankaj.ydvt@gmail.com';
-export const AUTHORIZED_PASSWORD = 'PANKaj1@';
+/**
+ * High-Entropy Salt and One-Way Salted Cryptographic Hash
+ * The master credentials (email and password) are NEVER stored in plaintext
+ * anywhere in the codebase or client JavaScript bundle.
+ * Even if reverse-engineered or inspected via browser DevTools,
+ * SHA-256 is mathematically irreversible.
+ */
+const CRYPTO_SALT = 'salestracker_secure_salt_2026_v1_';
+const MASTER_AUTH_HASH = '9e089fe1590bc2290d420b946abf52a6495539e17ec3d4c62a63334e755ec58f';
+
+// Storage keys for anti-tamper rate limiting and lockout
+const LOCKOUT_KEY = 'salestracker_sec_lockout_ts';
+const ATTEMPTS_KEY = 'salestracker_sec_fail_count';
+
+/**
+ * Constant-time comparison to prevent timing side-channel attacks
+ */
+function constantTimeCompare(a: string, b: string): boolean {
+  if (a.length !== b.length) return false;
+  let result = 0;
+  for (let i = 0; i < a.length; i++) {
+    result |= a.charCodeAt(i) ^ b.charCodeAt(i);
+  }
+  return result === 0;
+}
+
+/**
+ * Asynchronous Web Crypto SHA-256 hasher
+ */
+async function computeSha256Hex(content: string): Promise<string> {
+  const encoder = new TextEncoder();
+  const data = encoder.encode(content);
+  const hashBuffer = await crypto.subtle.digest('SHA-256', data);
+  const hashArray = Array.from(new Uint8Array(hashBuffer));
+  return hashArray.map((b) => b.toString(16).padStart(2, '0')).join('');
+}
 
 export const SecurityLockScreen: React.FC<SecurityLockScreenProps> = ({
   onUnlock,
@@ -32,39 +66,120 @@ export const SecurityLockScreen: React.FC<SecurityLockScreenProps> = ({
   const [rememberMe, setRememberMe] = useState(true);
   const [error, setError] = useState<string | null>(null);
   const [isVerifying, setIsVerifying] = useState(false);
-  const [attempts, setAttempts] = useState(0);
+  const [remainingLockoutSecs, setRemainingLockoutSecs] = useState<number>(0);
 
-  const handleSubmit = (e: React.FormEvent) => {
+  const countdownIntervalRef = useRef<any>(null);
+
+  // Initialize and check lockout status on mount
+  useEffect(() => {
+    const checkLockout = () => {
+      const lockoutExpiryStr = localStorage.getItem(LOCKOUT_KEY);
+      if (lockoutExpiryStr) {
+        const lockoutExpiry = parseInt(lockoutExpiryStr, 10);
+        const now = Date.now();
+        if (lockoutExpiry > now) {
+          const diffSecs = Math.ceil((lockoutExpiry - now) / 1000);
+          setRemainingLockoutSecs(diffSecs);
+          setError(`Security Cooldown Active: Too many failed attempts. Retry in ${diffSecs}s.`);
+          return;
+        } else {
+          // Lockout expired
+          localStorage.removeItem(LOCKOUT_KEY);
+          setRemainingLockoutSecs(0);
+        }
+      }
+    };
+
+    checkLockout();
+
+    countdownIntervalRef.current = setInterval(() => {
+      const lockoutExpiryStr = localStorage.getItem(LOCKOUT_KEY);
+      if (lockoutExpiryStr) {
+        const lockoutExpiry = parseInt(lockoutExpiryStr, 10);
+        const now = Date.now();
+        if (lockoutExpiry > now) {
+          const diffSecs = Math.ceil((lockoutExpiry - now) / 1000);
+          setRemainingLockoutSecs(diffSecs);
+        } else {
+          localStorage.removeItem(LOCKOUT_KEY);
+          setRemainingLockoutSecs(0);
+          setError(null);
+        }
+      }
+    }, 1000);
+
+    return () => {
+      if (countdownIntervalRef.current) clearInterval(countdownIntervalRef.current);
+    };
+  }, []);
+
+  const handleSubmit = async (e: React.FormEvent) => {
     e.preventDefault();
+    if (remainingLockoutSecs > 0) return;
+
     setError(null);
     setIsVerifying(true);
 
-    setTimeout(() => {
+    try {
       const cleanEmail = email.trim().toLowerCase();
       const cleanPass = password.trim();
 
-      if (cleanEmail === AUTHORIZED_EMAIL.toLowerCase() && cleanPass === AUTHORIZED_PASSWORD) {
+      // Zero-knowledge cryptographic check
+      const inputCombo = `${CRYPTO_SALT}${cleanEmail}:${cleanPass}`;
+      const calculatedHash = await computeSha256Hex(inputCombo);
+
+      const isValid = constantTimeCompare(calculatedHash, MASTER_AUTH_HASH);
+
+      if (isValid) {
+        // Success: Clear all failure records
+        localStorage.removeItem(LOCKOUT_KEY);
+        localStorage.removeItem(ATTEMPTS_KEY);
+
+        // Issue opaque authenticated session token (no private info stored)
+        const sessionToken = await computeSha256Hex(`session_${Date.now()}_${Math.random()}`);
         if (rememberMe) {
           localStorage.setItem('salestracker_auth_session', 'authenticated');
-          localStorage.setItem('salestracker_auth_email', AUTHORIZED_EMAIL);
+          localStorage.setItem('salestracker_auth_token', sessionToken);
         } else {
           sessionStorage.setItem('salestracker_auth_session', 'authenticated');
+          sessionStorage.setItem('salestracker_auth_token', sessionToken);
         }
+
+        // Clean memory zeroization
+        setEmail('');
+        setPassword('');
         setIsVerifying(false);
         onUnlock();
       } else {
+        // Increment failed attempts
+        const currentFails = parseInt(localStorage.getItem(ATTEMPTS_KEY) || '0', 10) + 1;
+        localStorage.setItem(ATTEMPTS_KEY, currentFails.toString());
+
         setIsVerifying(false);
-        setAttempts((prev) => prev + 1);
-        setError('Access Denied: Invalid email address or master password.');
+
+        if (currentFails >= 5) {
+          // 3-minute strict security lockout
+          const lockoutTime = Date.now() + 180 * 1000;
+          localStorage.setItem(LOCKOUT_KEY, lockoutTime.toString());
+          setRemainingLockoutSecs(180);
+          setError('Security Lockout: 5 failed attempts recorded. System access paused for 3 minutes.');
+        } else if (currentFails >= 3) {
+          // 30-second penalty lockout
+          const lockoutTime = Date.now() + 30 * 1000;
+          localStorage.setItem(LOCKOUT_KEY, lockoutTime.toString());
+          setRemainingLockoutSecs(30);
+          setError('Multiple failed attempts detected. Cooldown enforced for 30 seconds.');
+        } else {
+          setError(`Access Denied: Invalid credentials. (${currentFails}/5 attempts used)`);
+        }
       }
-    }, 400);
+    } catch (err: any) {
+      setIsVerifying(false);
+      setError('Cryptographic verification error. Please retry.');
+    }
   };
 
-  const handleQuickFill = () => {
-    setEmail(AUTHORIZED_EMAIL);
-    setPassword(AUTHORIZED_PASSWORD);
-    setError(null);
-  };
+  const isFormLocked = remainingLockoutSecs > 0;
 
   return (
     <div className="min-h-screen bg-slate-950 text-slate-100 flex flex-col justify-between items-center p-4 sm:p-6 selection:bg-indigo-500 selection:text-white relative overflow-hidden font-sans">
@@ -89,7 +204,7 @@ export const SecurityLockScreen: React.FC<SecurityLockScreenProps> = ({
               </span>
             </div>
             <span className="text-[10px] text-slate-400 block -mt-0.5 font-medium">
-              Enterprise Secure Access Control
+              Zero-Knowledge Secure Gate
             </span>
           </div>
         </div>
@@ -97,7 +212,7 @@ export const SecurityLockScreen: React.FC<SecurityLockScreenProps> = ({
         <div className="flex items-center gap-2">
           <div className="hidden sm:inline-flex items-center gap-1.5 px-3 py-1 rounded-full text-xs font-semibold bg-slate-900 border border-slate-800 text-slate-400">
             <ShieldCheck className="w-3.5 h-3.5 text-emerald-400" />
-            <span>256-Bit Master Lock</span>
+            <span>SHA-256 Salted Authentication</span>
           </div>
         </div>
       </div>
@@ -127,6 +242,19 @@ export const SecurityLockScreen: React.FC<SecurityLockScreenProps> = ({
             </div>
           )}
 
+          {/* Cooldown Active Banner */}
+          {isFormLocked && (
+            <div className="mb-5 p-3 rounded-2xl bg-amber-950/70 border border-amber-800/80 text-amber-200 text-xs flex items-center justify-between">
+              <div className="flex items-center gap-2">
+                <Clock className="w-4 h-4 text-amber-400 animate-spin" />
+                <span className="font-semibold">Security Cooldown Enforced</span>
+              </div>
+              <span className="font-mono font-bold text-amber-300 bg-amber-950 px-2 py-0.5 rounded border border-amber-800">
+                {remainingLockoutSecs}s
+              </span>
+            </div>
+          )}
+
           {/* Login Form */}
           <form onSubmit={handleSubmit} className="space-y-4">
             
@@ -140,11 +268,12 @@ export const SecurityLockScreen: React.FC<SecurityLockScreenProps> = ({
                 <input
                   type="email"
                   required
+                  disabled={isFormLocked || isVerifying}
                   value={email}
                   onChange={(e) => setEmail(e.target.value)}
-                  placeholder="pankaj.ydvt@gmail.com"
+                  placeholder="Enter administrator email..."
                   autoComplete="email"
-                  className="w-full pl-10 pr-4 py-3 rounded-xl bg-slate-950 border border-slate-800 text-white text-xs font-mono focus:outline-hidden focus:ring-2 focus:ring-indigo-500 focus:border-indigo-500 transition"
+                  className="w-full pl-10 pr-4 py-3 rounded-xl bg-slate-950 border border-slate-800 text-white text-xs font-mono focus:outline-hidden focus:ring-2 focus:ring-indigo-500 focus:border-indigo-500 transition disabled:opacity-50 disabled:cursor-not-allowed"
                 />
               </div>
             </div>
@@ -155,29 +284,24 @@ export const SecurityLockScreen: React.FC<SecurityLockScreenProps> = ({
                 <label className="block text-[11px] font-bold uppercase tracking-wider text-slate-400">
                   Master Password
                 </label>
-                <button
-                  type="button"
-                  onClick={handleQuickFill}
-                  className="text-[11px] text-indigo-400 hover:text-indigo-300 font-semibold flex items-center gap-1 transition"
-                >
-                  <Sparkles className="w-3 h-3" /> Auto-fill
-                </button>
               </div>
               <div className="relative">
                 <KeyRound className="w-4 h-4 text-slate-400 absolute left-3.5 top-1/2 -translate-y-1/2" />
                 <input
                   type={showPassword ? 'text' : 'password'}
                   required
+                  disabled={isFormLocked || isVerifying}
                   value={password}
                   onChange={(e) => setPassword(e.target.value)}
-                  placeholder="Enter password..."
+                  placeholder="Enter master password..."
                   autoComplete="current-password"
-                  className="w-full pl-10 pr-10 py-3 rounded-xl bg-slate-950 border border-slate-800 text-white text-xs font-mono focus:outline-hidden focus:ring-2 focus:ring-indigo-500 focus:border-indigo-500 transition"
+                  className="w-full pl-10 pr-10 py-3 rounded-xl bg-slate-950 border border-slate-800 text-white text-xs font-mono focus:outline-hidden focus:ring-2 focus:ring-indigo-500 focus:border-indigo-500 transition disabled:opacity-50 disabled:cursor-not-allowed"
                 />
                 <button
                   type="button"
+                  disabled={isFormLocked}
                   onClick={() => setShowPassword((prev) => !prev)}
-                  className="absolute right-3 top-1/2 -translate-y-1/2 text-slate-400 hover:text-slate-200 p-1"
+                  className="absolute right-3 top-1/2 -translate-y-1/2 text-slate-400 hover:text-slate-200 p-1 disabled:opacity-40"
                 >
                   {showPassword ? <EyeOff className="w-4 h-4" /> : <Eye className="w-4 h-4" />}
                 </button>
@@ -189,9 +313,10 @@ export const SecurityLockScreen: React.FC<SecurityLockScreenProps> = ({
               <label className="flex items-center gap-2 cursor-pointer text-slate-400 hover:text-slate-200">
                 <input
                   type="checkbox"
+                  disabled={isFormLocked}
                   checked={rememberMe}
                   onChange={(e) => setRememberMe(e.target.checked)}
-                  className="rounded text-indigo-600 focus:ring-indigo-500 bg-slate-950 border-slate-800"
+                  className="rounded text-indigo-600 focus:ring-indigo-500 bg-slate-950 border-slate-800 disabled:opacity-50"
                 />
                 <span>Remember this device</span>
               </label>
@@ -201,30 +326,28 @@ export const SecurityLockScreen: React.FC<SecurityLockScreenProps> = ({
             {/* Unlock Button */}
             <button
               type="submit"
-              disabled={isVerifying}
-              className="w-full mt-2 py-3.5 px-4 rounded-xl bg-indigo-600 hover:bg-indigo-500 active:scale-[0.99] text-white text-xs font-bold transition shadow-lg shadow-indigo-600/30 flex items-center justify-center gap-2 disabled:opacity-50"
+              disabled={isVerifying || isFormLocked}
+              className="w-full mt-2 py-3.5 px-4 rounded-xl bg-indigo-600 hover:bg-indigo-500 active:scale-[0.99] text-white text-xs font-bold transition shadow-lg shadow-indigo-600/30 flex items-center justify-center gap-2 disabled:opacity-50 disabled:cursor-not-allowed"
             >
               <ShieldCheck className="w-4 h-4" />
-              <span>{isVerifying ? 'Authenticating...' : 'Unlock System'}</span>
+              <span>
+                {isVerifying
+                  ? 'Verifying Cryptography...'
+                  : isFormLocked
+                  ? `Locked (${remainingLockoutSecs}s)`
+                  : 'Unlock System'}
+              </span>
               <ArrowRight className="w-4 h-4" />
             </button>
 
           </form>
 
-          {/* Quick Helper Credentials Notice */}
+          {/* Security Notice */}
           <div className="mt-6 pt-5 border-t border-slate-800/80 text-center">
-            <p className="text-[11px] text-slate-400">
-              Master Access Credentials:
+            <p className="text-[11px] text-slate-500 flex items-center justify-center gap-1.5">
+              <CheckCircle2 className="w-3.5 h-3.5 text-emerald-500" />
+              <span>Cryptographic Salted Verification • Zero Plaintext Storage</span>
             </p>
-            <div className="mt-1.5 flex items-center justify-center gap-2 font-mono text-[11px] text-indigo-300">
-              <span className="bg-slate-950 px-2 py-0.5 rounded border border-slate-800">
-                pankaj.ydvt@gmail.com
-              </span>
-              <span className="text-slate-400">•</span>
-              <span className="bg-slate-950 px-2 py-0.5 rounded border border-slate-800">
-                PANKaj1@
-              </span>
-            </div>
           </div>
 
         </div>
